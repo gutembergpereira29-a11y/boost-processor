@@ -193,48 +193,27 @@ def compute_smart_speaker_timeline(video_path: str, target_w: int, frame_w: int,
 
 
 def render_scene_switching_vertical(input_video: str, output_clip: str, start_sec: int, duration_sec: int):
-    temp_raw = output_clip.replace(".mp4", "_raw.mp4")
-    cmd_extract = [
-        "ffmpeg", "-y",
-        "-ss", str(start_sec),
-        "-t", str(duration_sec),
-        "-i", input_video,
-        "-c", "copy",
-        temp_raw
+    """Render a real, playable 9:16 MP4. Never report a clip ready before FFmpeg succeeds."""
+    if duration_sec <= 0:
+        raise ValueError("Duração do corte inválida")
+    # Scale to fill 9:16 and crop the center. This also works with vertical
+    # and square sources and doesn't depend on optional OpenCV DNN downloads.
+    cmd = [
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+        "-ss", str(start_sec), "-i", input_video, "-t", str(duration_sec),
+        "-vf", "scale=1080:1920:force_original_aspect_ratio=increase,"
+               "crop=1080:1920,setsar=1,format=yuv420p",
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+        "-c:a", "aac", "-b:a", "160k",
+        "-movflags", "+faststart", "-shortest", output_clip
     ]
-    subprocess.run(cmd_extract, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-    cap = cv2.VideoCapture(temp_raw)
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 1920
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 1080
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    cap.release()
-
-    target_crop_w = int(height * (9 / 16))
-    if target_crop_w % 2 != 0:
-        target_crop_w += 1
-
-    segments = compute_smart_speaker_timeline(temp_raw, target_crop_w, width, height, fps)
-
-    cond_x_expr = str(segments[0][2])
-    for s_start, s_end, sx in reversed(segments):
-        cond_x_expr = f"if(between(t,{s_start:.2f},{s_end:.2f}),{sx},{cond_x_expr})"
-
-    vf_filter = f"crop=w={target_crop_w}:h={height}:x='{cond_x_expr}':y=0,scale=1080:1920:flags=lanczos"
-
-    cmd_render = [
-        "ffmpeg", "-y",
-        "-i", temp_raw,
-        "-vf", vf_filter,
-        "-c:v", "libx264",
-        "-preset", "ultrafast",
-        "-crf", "19",
-        "-c:a", "aac",
-        "-b:a", "192k",
-        output_clip
-    ]
-    subprocess.run(cmd_render, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    safe_remove(temp_raw)
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+    if result.returncode != 0:
+        safe_remove(output_clip)
+        raise RuntimeError("FFmpeg falhou: " + result.stderr[-800:])
+    if not os.path.isfile(output_clip) or os.path.getsize(output_clip) < 1024:
+        safe_remove(output_clip)
+        raise RuntimeError("FFmpeg não produziu um MP4 válido")
 
 
 class ProcessRequest(BaseModel):
@@ -374,29 +353,26 @@ def generate_contextual_title(start_sec: int, end_sec: int, subtitles: List[Dict
 
 def find_strategic_moments(video_path: str, vtt_path: str, num_clips: int, min_dur: int, max_dur: int) -> List[Dict[str, Any]]:
     total_duration = get_video_duration(video_path)
-    safe_end = max(max_dur + 20, total_duration - 15)
-    step = max(10, (safe_end - 45) / max(num_clips, 1))
-
+    if total_duration <= 1:
+        raise ValueError("O vídeo não possui duração suficiente para gerar cortes")
+    count = max(1, min(int(num_clips), 10))
+    available = max(1, int(total_duration) - 1)
+    requested = max(5, min(int(max_dur), available))
+    # Choose only start/end ranges that fit the actual source duration.
+    # Clips may overlap for short sources rather than extending beyond EOF.
+    max_start = max(0, int(total_duration) - requested - 1)
     subtitles = parse_vtt_subtitles(vtt_path)
     moments = []
-
-    for i in range(num_clips):
-        clip_duration = random.randint(min_dur, max_dur)
-        zone_start = 45 + (i * step)
-        zone_end = min(zone_start + step - clip_duration, safe_end - clip_duration)
-        chosen_start = int(zone_start if zone_end <= zone_start else random.uniform(zone_start, zone_end))
-        chosen_end = chosen_start + clip_duration
-
-        title = generate_contextual_title(chosen_start, chosen_end, subtitles, i + 1)
-
+    for i in range(count):
+        start = round(max_start * i / max(count - 1, 1))
+        duration = min(requested, max(1, int(total_duration - start - 0.25)))
         moments.append({
-            "start": chosen_start,
-            "end": chosen_end,
-            "duration": clip_duration,
-            "title": title,
-            "score": random.randint(91, 98)
+            "start": start,
+            "end": start + duration,
+            "duration": duration,
+            "title": generate_contextual_title(start, start + duration, subtitles, i + 1),
+            "score": 0
         })
-
     return moments
 
 
@@ -414,10 +390,12 @@ def run_real_pipeline(job_id: str, request_data: ProcessRequest, base_url: str):
         video_candidates = [f for f in matches if not f.endswith(".vtt") and not f.endswith(".part") and not f.endswith(".ytdl")]
         if not video_candidates:
             raise FileNotFoundError("O ficheiro de vídeo não foi encontrado após a transferência.")
-        source_video = video_candidates[0]
+        source_video = max(video_candidates, key=os.path.getsize)
+        if os.path.getsize(source_video) < 1024:
+            raise RuntimeError("O arquivo de origem foi baixado vazio")
 
         payload_dict = request_data.dict()
-        num_clips = extract_clip_quantity(payload_dict, default=5)
+        num_clips = max(1, min(10, extract_clip_quantity(payload_dict, default=5)))
         raw_duration = request_data.duration or request_data.duration_seconds or payload_dict.get("durationRange")
         min_dur, max_dur = parse_duration_range(raw_duration, default_min=30, default_max=55)
 
@@ -440,7 +418,7 @@ def run_real_pipeline(job_id: str, request_data: ProcessRequest, base_url: str):
                 duration_sec=cut["duration"]
             )
 
-            clip_url = f"{base_url}/downloads/{clip_filename}"
+            clip_url = f"/downloads/{clip_filename}"
             generated_clips.append({
                 "id": str(uuid.uuid4()),
                 "title": cut["title"],
@@ -464,7 +442,7 @@ def run_real_pipeline(job_id: str, request_data: ProcessRequest, base_url: str):
     except Exception as e:
         print(f"[ERRO NO PIPELINE]: {e}")
         jobs[job_id]["status"] = "failed"
-        jobs[job_id]["error"] = str(e)
+        jobs[job_id]["error"] = str(e)[:1000]
     finally:
         for f in glob.glob(os.path.join(DOWNLOADS_DIR, f"source_{prefix}*")):
             safe_remove(f)
