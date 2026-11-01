@@ -11,9 +11,10 @@ import subprocess
 from typing import Optional, List, Dict, Any, Union
 import cv2
 import numpy as np
-from fastapi import FastAPI, BackgroundTasks, HTTPException, Request, Response
+from fastapi import FastAPI, BackgroundTasks, HTTPException, Request, Response, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Extra
 import yt_dlp
 
@@ -531,3 +532,79 @@ async def cancel_job(job_id: str):
     if proc is not None and proc.poll() is None:
         proc.terminate()
     return {"job_id": job_id, "status": "cancelled"}
+
+
+@app.post("/audio/mix")
+async def mix_audio(req: Request, video: UploadFile = File(...), music: UploadFile = File(...),
+                    original_volume: int = Form(100), music_volume: int = Form(30)):
+    """Mix authorized audio with an uploaded video and return a new MP4."""
+    # Verify the user's Supabase session on the server. A browser Origin header
+    # is not an access control and the tunnel is a public internet endpoint.
+    supabase_url = os.getenv("SUPABASE_URL", "").rstrip("/")
+    supabase_key = os.getenv("SUPABASE_ANON_KEY", "")
+    if not supabase_url.startswith("https://") or not supabase_key:
+        raise HTTPException(503, "Configure SUPABASE_URL e SUPABASE_ANON_KEY no processador")
+    authorization = req.headers.get("authorization", "")
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(401, "Faça login para editar vídeos")
+    def verify_user():
+        request = urllib.request.Request(
+            supabase_url + "/auth/v1/user",
+            headers={"apikey": supabase_key, "Authorization": authorization},
+            method="GET"
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=12) as response:
+                data = json.load(response)
+                return bool(data.get("id"))
+        except Exception:
+            return False
+    if not await asyncio.to_thread(verify_user):
+        raise HTTPException(401, "Sessão inválida ou expirada")
+
+    if not 0 <= original_volume <= 100 or not 0 <= music_volume <= 100:
+        raise HTTPException(422, "Volume deve estar entre 0 e 100")
+    job_key = uuid.uuid4().hex
+    video_path = os.path.join(DOWNLOADS_DIR, job_key + "-input.mp4")
+    music_path = os.path.join(DOWNLOADS_DIR, job_key + "-music")
+    result_path = os.path.join(DOWNLOADS_DIR, job_key + "-mixed.mp4")
+    paths = [video_path, music_path, result_path]
+    try:
+        for upload, dest, limit in ((video, video_path, 160 * 1024 * 1024),
+                                    (music, music_path, 25 * 1024 * 1024)):
+            total = 0
+            with open(dest, "wb") as out:
+                while chunk := await upload.read(1024 * 1024):
+                    total += len(chunk)
+                    if total > limit:
+                        raise HTTPException(413, "Arquivo maior que o permitido")
+                    out.write(chunk)
+            if total < 100:
+                raise HTTPException(422, "Arquivo vazio")
+        probe = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "a:0",
+                                "-show_entries", "stream=index", "-of", "csv=p=0", video_path],
+                               capture_output=True, text=True, timeout=25)
+        has_audio = probe.returncode == 0 and bool(probe.stdout.strip())
+        if has_audio:
+            filters = "[0:a]volume=" + str(original_volume/100) + "[voice];[1:a]volume=" + str(music_volume/100) + "[music];[voice][music]amix=inputs=2:duration=first:dropout_transition=0[out]"
+        else:
+            filters = "[1:a]volume=" + str(music_volume/100) + "[out]"
+        cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+               "-i", video_path, "-stream_loop", "-1", "-i", music_path,
+               "-filter_complex", filters, "-map", "0:v:0", "-map", "[out]",
+               "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+               "-shortest", "-movflags", "+faststart", result_path]
+        completed = await asyncio.to_thread(subprocess.run, cmd, capture_output=True, text=True, timeout=600)
+        if completed.returncode != 0 or not os.path.exists(result_path) or os.path.getsize(result_path) < 1024:
+            raise HTTPException(422, "Não foi possível misturar os áudios: " + completed.stderr[-240:])
+        cleanup = BackgroundTasks()
+        for path in paths:
+            cleanup.add_task(safe_remove, path)
+        return FileResponse(result_path, media_type="video/mp4", filename="boost-studio-com-audio.mp4",
+                            background=cleanup, headers={"Cache-Control":"no-store"})
+    except HTTPException:
+        for path in paths: safe_remove(path)
+        raise
+    except Exception:
+        for path in paths: safe_remove(path)
+        raise HTTPException(500, "Falha no processamento do áudio")
