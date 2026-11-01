@@ -1,0 +1,6 @@
+fastapi
+uvicorn
+yt-dlp
+opencv-python-headless
+numpy
+pydantic
