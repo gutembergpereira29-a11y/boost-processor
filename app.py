@@ -192,7 +192,7 @@ def compute_smart_speaker_timeline(video_path: str, target_w: int, frame_w: int,
     return segments
 
 
-def render_scene_switching_vertical(input_video: str, output_clip: str, start_sec: int, duration_sec: int):
+def render_scene_switching_vertical(input_video: str, output_clip: str, start_sec: int, duration_sec: int, job_id: str):
     """Render a real, playable 9:16 MP4. Never report a clip ready before FFmpeg succeeds."""
     if duration_sec <= 0:
         raise ValueError("Duração do corte inválida")
@@ -207,10 +207,22 @@ def render_scene_switching_vertical(input_video: str, output_clip: str, start_se
         "-c:a", "aac", "-b:a", "160k",
         "-movflags", "+faststart", "-shortest", output_clip
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
-    if result.returncode != 0:
+    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+    jobs[job_id]["process"] = proc
+    try:
+        _, stderr = proc.communicate(timeout=600)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.communicate()
+        raise RuntimeError("FFmpeg excedeu o tempo máximo do corte")
+    finally:
+        jobs[job_id]["process"] = None
+    if jobs[job_id].get("cancel_requested"):
         safe_remove(output_clip)
-        raise RuntimeError("FFmpeg falhou: " + result.stderr[-800:])
+        raise RuntimeError("Processamento cancelado")
+    if proc.returncode != 0:
+        safe_remove(output_clip)
+        raise RuntimeError("FFmpeg falhou: " + (stderr or "")[-800:])
     if not os.path.isfile(output_clip) or os.path.getsize(output_clip) < 1024:
         safe_remove(output_clip)
         raise RuntimeError("FFmpeg não produziu um MP4 válido")
@@ -381,10 +393,12 @@ def run_real_pipeline(job_id: str, request_data: ProcessRequest, base_url: str):
     output_tmpl = os.path.join(DOWNLOADS_DIR, f"source_{prefix}.%(ext)s")
 
     try:
+        if jobs[job_id].get("cancel_requested"): return
         jobs[job_id]["status"] = "processing"
         jobs[job_id]["progress"] = 15
         
         download_youtube_with_subtitles(request_data.url, output_tmpl)
+        if jobs[job_id].get("cancel_requested"): return
 
         matches = glob.glob(os.path.join(DOWNLOADS_DIR, f"source_{prefix}.*"))
         video_candidates = [f for f in matches if not f.endswith(".vtt") and not f.endswith(".part") and not f.endswith(".ytdl")]
@@ -408,6 +422,7 @@ def run_real_pipeline(job_id: str, request_data: ProcessRequest, base_url: str):
         generated_clips = []
 
         for idx, cut in enumerate(strategic_cuts):
+            if jobs[job_id].get("cancel_requested"): return
             clip_filename = f"clip_{prefix}_{idx + 1}.mp4"
             clip_path = os.path.join(DOWNLOADS_DIR, clip_filename)
 
@@ -415,7 +430,8 @@ def run_real_pipeline(job_id: str, request_data: ProcessRequest, base_url: str):
                 input_video=source_video,
                 output_clip=clip_path,
                 start_sec=cut["start"],
-                duration_sec=cut["duration"]
+                duration_sec=cut["duration"],
+                job_id=job_id
             )
 
             clip_url = f"/downloads/{clip_filename}"
@@ -435,14 +451,15 @@ def run_real_pipeline(job_id: str, request_data: ProcessRequest, base_url: str):
 
             jobs[job_id]["progress"] = int(35 + ((idx + 1) / num_clips) * 60)
 
+        if jobs[job_id].get("cancel_requested"): return
         jobs[job_id]["status"] = "completed"
         jobs[job_id]["progress"] = 100
         jobs[job_id]["clips"] = generated_clips
 
     except Exception as e:
         print(f"[ERRO NO PIPELINE]: {e}")
-        jobs[job_id]["status"] = "failed"
-        jobs[job_id]["error"] = str(e)[:1000]
+        jobs[job_id]["status"] = "cancelled" if jobs[job_id].get("cancel_requested") else "failed"
+        jobs[job_id]["error"] = None if jobs[job_id].get("cancel_requested") else str(e)[:1000]
     finally:
         for f in glob.glob(os.path.join(DOWNLOADS_DIR, f"source_{prefix}*")):
             safe_remove(f)
@@ -465,7 +482,9 @@ async def process_video(request: ProcessRequest, req: Request, background_tasks:
         "status": "processing",
         "progress": 5,
         "clips": [],
-        "error": None
+        "error": None,
+        "cancel_requested": False,
+        "process": None
     }
     
     host = req.headers.get("x-forwarded-host") or req.headers.get("host") or ""
@@ -497,3 +516,18 @@ async def get_status(job_id: str):
         "clips": job["clips"],
         "error": job["error"]
     }
+
+
+@app.post("/cancel/{job_id}")
+async def cancel_job(job_id: str):
+    job = jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Processamento não encontrado")
+    if job["status"] in ("completed", "failed", "cancelled"):
+        return {"job_id": job_id, "status": job["status"]}
+    job["cancel_requested"] = True
+    job["status"] = "cancelled"
+    proc = job.get("process")
+    if proc is not None and proc.poll() is None:
+        proc.terminate()
+    return {"job_id": job_id, "status": "cancelled"}
