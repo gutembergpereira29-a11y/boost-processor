@@ -15,6 +15,4 @@ jobs:
         run: python -m py_compile app.py
       - name: Validate FFmpeg availability
         run: |
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg
           ffmpeg -version
