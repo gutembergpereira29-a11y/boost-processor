@@ -535,9 +535,33 @@ async def cancel_job(job_id: str):
 
 
 @app.post("/audio/mix")
-async def mix_audio(video: UploadFile = File(...), music: UploadFile = File(...),
+async def mix_audio(req: Request, video: UploadFile = File(...), music: UploadFile = File(...),
                     original_volume: int = Form(100), music_volume: int = Form(30)):
     """Mix authorized audio with an uploaded video and return a new MP4."""
+    # Verify the user's Supabase session on the server. A browser Origin header
+    # is not an access control and the tunnel is a public internet endpoint.
+    supabase_url = os.getenv("SUPABASE_URL", "").rstrip("/")
+    supabase_key = os.getenv("SUPABASE_ANON_KEY", "")
+    if not supabase_url.startswith("https://") or not supabase_key:
+        raise HTTPException(503, "Configure SUPABASE_URL e SUPABASE_ANON_KEY no processador")
+    authorization = req.headers.get("authorization", "")
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(401, "Faça login para editar vídeos")
+    def verify_user():
+        request = urllib.request.Request(
+            supabase_url + "/auth/v1/user",
+            headers={"apikey": supabase_key, "Authorization": authorization},
+            method="GET"
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=12) as response:
+                data = json.load(response)
+                return bool(data.get("id"))
+        except Exception:
+            return False
+    if not await asyncio.to_thread(verify_user):
+        raise HTTPException(401, "Sessão inválida ou expirada")
+
     if not 0 <= original_volume <= 100 or not 0 <= music_volume <= 100:
         raise HTTPException(422, "Volume deve estar entre 0 e 100")
     job_key = uuid.uuid4().hex
