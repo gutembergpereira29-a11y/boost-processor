@@ -16,6 +16,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Extra
+from highlight_ranker import rank_highlights
 import yt_dlp
 
 app = FastAPI(title="Boost Studio Cloud Processor")
@@ -439,7 +440,13 @@ def run_real_pipeline(job_id: str, request_data: ProcessRequest, base_url: str):
         vtt_matches = [f for f in matches if f.endswith(".vtt")]
         active_vtt = vtt_matches[0] if vtt_matches else ""
 
-        strategic_cuts = find_strategic_moments(source_video, active_vtt, num_clips, min_dur, max_dur)
+        transcript = parse_vtt_subtitles(active_vtt)
+        if transcript:
+            strategic_cuts = rank_highlights(transcript, get_video_duration(source_video), min_dur, max_dur, num_clips)
+            for index, cut in enumerate(strategic_cuts):
+                cut["title"] = generate_contextual_title(cut["start"], cut["end"], transcript, index + 1)
+        else:
+            strategic_cuts = find_strategic_moments(source_video, active_vtt, 1, min_dur, max_dur)
         generated_clips = []
 
         for idx, cut in enumerate(strategic_cuts):
@@ -467,6 +474,7 @@ def run_real_pipeline(job_id: str, request_data: ProcessRequest, base_url: str):
                 "duration": int(cut["duration"]),
                 "score": int(cut["score"]),
                 "viral_score": int(cut["score"]),
+                "reason": cut.get("reason", "Pontuação heurística das legendas"),
                 "status": "ready"
             })
 
