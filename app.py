@@ -474,6 +474,7 @@ def run_real_pipeline(job_id: str, request_data: ProcessRequest, base_url: str):
                 "duration": int(cut["duration"]),
                 "score": int(cut["score"]),
                 "viral_score": int(cut["score"]),
+                "reason": cut.get("reason", "Pontuação heurística das legendas"),
                 "status": "ready"
             })
 
