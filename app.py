@@ -16,6 +16,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Extra
+from highlight_ranker import rank_highlights
 import yt_dlp
 
 app = FastAPI(title="Boost Studio Cloud Processor")
