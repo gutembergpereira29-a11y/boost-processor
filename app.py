@@ -364,30 +364,48 @@ def generate_contextual_title(start_sec: int, end_sec: int, subtitles: List[Dict
     return f"Momento Estratégico ({mins:02d}:{secs:02d})"
 
 
-def find_strategic_moments(video_path: str, vtt_path: str, num_clips: int, min_dur: int, max_dur: int) -> List[Dict[str, Any]]:
+def find_strategic_moments(video_path: str, vtt_path: str, num_clips: Optional[int], min_dur: int, max_dur: int) -> List[Dict[str, Any]]:
+    """Rank non-overlapping candidate highlights using subtitles, without a fixed count."""
     total_duration = get_video_duration(video_path)
     if total_duration <= 1:
         raise ValueError("O vídeo não possui duração suficiente para gerar cortes")
-    count = max(1, min(int(num_clips), 10))
-    available = max(1, int(total_duration) - 1)
-    requested = max(5, min(int(max_dur), available))
-    # Choose only start/end ranges that fit the actual source duration.
-    # Clips may overlap for short sources rather than extending beyond EOF.
-    max_start = max(0, int(total_duration) - requested - 1)
     subtitles = parse_vtt_subtitles(vtt_path)
-    moments = []
-    for i in range(count):
-        start = round(max_start * i / max(count - 1, 1))
-        duration = min(requested, max(1, int(total_duration - start - 0.25)))
-        moments.append({
-            "start": start,
-            "end": start + duration,
-            "duration": duration,
-            "title": generate_contextual_title(start, start + duration, subtitles, i + 1),
-            "score": 0
-        })
-    return moments
-
+    length = max(8, min(int(max_dur), max(1, int(total_duration) - 1)))
+    max_start = max(0, int(total_duration) - length)
+    keywords = ("segredo", "verdade", "erro", "dinheiro", "resultado", "sucesso",
+                "ninguém", "você", "como", "porque", "importante", "atenção",
+                "aprendi", "descobri", "nunca", "sempre", "melhor", "pior",
+                "mudou", "precisa", "história", "problema")
+    candidates = []
+    for entry in subtitles:
+        start = max(0, min(max_start, int(entry["time"]) - 3))
+        lines = [str(row["text"]) for row in subtitles if start <= row["time"] < start + length]
+        spoken = " ".join(lines).lower()
+        if len(spoken.split()) < 12:
+            continue
+        score = 2 * sum(word in spoken for word in keywords) + min(3, len(lines) // 3)
+        score += int(any("?" in line or "!" in line for line in lines))
+        if score >= 3:
+            candidates.append((score, start))
+    if not subtitles:
+        # Without a transcript we cannot honestly rank semantic highlights.
+        candidates = [(0, min(max_start, max(0, int(total_duration // 2 - length // 2))))]
+    candidates.sort(key=lambda item: (-item[0], item[1]))
+    chosen = []
+    for score, start in candidates:
+        if any(start < prev + length and prev < start + length for _, prev in chosen):
+            continue
+        chosen.append((score, start))
+        if num_clips is not None and len(chosen) >= num_clips:
+            break
+    chosen.sort(key=lambda item: item[1])
+    return [{
+        "start": start,
+        "end": min(int(total_duration), start + length),
+        "duration": min(length, max(1, int(total_duration - start))),
+        "title": generate_contextual_title(start, start + length, subtitles, index + 1),
+        "score": min(100, 40 + score * 5) if subtitles else 0
+    } for index, (score, start) in enumerate(chosen)]
 
 def run_real_pipeline(job_id: str, request_data: ProcessRequest, base_url: str):
     prefix = job_id[:8]
@@ -410,7 +428,9 @@ def run_real_pipeline(job_id: str, request_data: ProcessRequest, base_url: str):
             raise RuntimeError("O arquivo de origem foi baixado vazio")
 
         payload_dict = request_data.dict()
-        num_clips = max(1, min(10, extract_clip_quantity(payload_dict, default=5)))
+        raw_count = payload_dict.get("quantity")
+        automatic = raw_count is None or str(raw_count).strip().lower() in ("auto", "automatico", "automático", "all")
+        num_clips = None if automatic else max(1, extract_clip_quantity(payload_dict, default=5))
         raw_duration = request_data.duration or request_data.duration_seconds or payload_dict.get("durationRange")
         min_dur, max_dur = parse_duration_range(raw_duration, default_min=30, default_max=55)
 
@@ -450,7 +470,7 @@ def run_real_pipeline(job_id: str, request_data: ProcessRequest, base_url: str):
                 "status": "ready"
             })
 
-            jobs[job_id]["progress"] = int(35 + ((idx + 1) / num_clips) * 60)
+            jobs[job_id]["progress"] = int(35 + ((idx + 1) / len(strategic_cuts)) * 60)
 
         if jobs[job_id].get("cancel_requested"): return
         jobs[job_id]["status"] = "completed"
