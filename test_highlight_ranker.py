@@ -23,7 +23,7 @@ class RankerTests(unittest.TestCase):
     def test_selects_multiple_independent_candidates_without_fixed_five(self):
         rows = []
         for start in (0, 95, 200, 320, 440, 560):
-            rows += passage(start, "Voce sabia o segredo para vencer o medo?")
+            rows += passage(start, f"Voce sabia o segredo para vencer o medo? {start}")
         found = rank_highlights(rows, 650, 25, 46)
         self.assertGreater(len(found), 5)
         self.assertTrue(all(a["end"] <= b["start"] for a, b in zip(found, found[1:])))
