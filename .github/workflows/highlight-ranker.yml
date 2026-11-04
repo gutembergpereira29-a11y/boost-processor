@@ -1,0 +1,21 @@
+name: Clip ranking tests
+on:
+  pull_request:
+    paths:
+      - "highlight_ranker.py"
+      - "test_highlight_ranker.py"
+      - ".github/workflows/highlight-ranker.yml"
+  push:
+    branches: [main]
+jobs:
+  ranker-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Compile ranker
+        run: python -m py_compile highlight_ranker.py
+      - name: Run unit tests
+        run: python -m unittest -v test_highlight_ranker.py
